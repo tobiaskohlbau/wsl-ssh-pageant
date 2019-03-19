@@ -11,9 +11,12 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"reflect"
+	"strconv"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/Microsoft/go-winio"
@@ -22,10 +25,12 @@ import (
 )
 
 var (
-	unixSocket = flag.String("wsl", "", "Path to Unix socket for passthrough to WSL")
-	namedPipe  = flag.String("winssh", "", "Named pipe for use with Win32 OpenSSH")
-	verbose    = flag.Bool("verbose", false, "Enable verbose logging")
-	force      = flag.Bool("force", false, "Forces the usage of the socket (unlink existing socket)")
+	unixSocket   = flag.String("wsl", "", "Path to Unix socket for passthrough to WSL")
+	namedPipe    = flag.String("winssh", "", "Named pipe for use with Win32 OpenSSH")
+	dockerSocket = flag.String("docker", "", "Path to Unix socket for passthrough to WSL")
+	gpgSocket    = flag.String("gpg", "", "Path to Unix socket folder for passthrough to WSL")
+	verbose      = flag.Bool("verbose", false, "Enable verbose logging")
+	force        = flag.Bool("force", false, "Forces the usage of the socket (unlink existing socket)")
 )
 
 const (
@@ -124,7 +129,7 @@ func queryPageant(buf []byte) (result []byte, err error) {
 
 var failureMessage = [...]byte{0, 0, 0, 1, 5}
 
-func handleConnection(conn net.Conn) {
+func handleSSHConnection(conn net.Conn) {
 	defer conn.Close()
 
 	reader := bufio.NewReader(conn)
@@ -169,7 +174,81 @@ func handleConnection(conn net.Conn) {
 	}
 }
 
-func listenLoop(ln net.Listener) {
+func handleDockerConnection(conn net.Conn) {
+	defer conn.Close()
+
+	namedPipeFullName := "\\\\.\\pipe\\docker_engine"
+	timeout := 3 * time.Second
+	dockerConn, err := winio.DialPipe(namedPipeFullName, &timeout)
+	if err != nil {
+		log.Fatalf("Could not connect named pipe %s, error %q\n", namedPipeFullName, err)
+	}
+
+	go func() {
+		_, err := io.Copy(dockerConn, conn)
+		if err != nil && err != io.EOF {
+			log.Printf("Could not copy docker data from named pipe to socket: %q", err)
+		}
+	}()
+
+	_, err = io.Copy(conn, dockerConn)
+	if err != nil && err != io.EOF {
+		log.Printf("Could not copy docker data from socket to named pipe: %s", err)
+	}
+}
+
+func handleGPGConnection(conn net.Conn, path string) {
+	defer conn.Close()
+
+	var port int
+	var nonce [16]byte
+
+	file, err := os.Open(path)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	reader := bufio.NewReader(file)
+
+	tmp, _, err := reader.ReadLine()
+	port, err = strconv.Atoi(string(tmp))
+	if err != nil {
+		log.Fatalf("Could not read port from gpg socket: %q", err)
+	}
+
+	n, err := reader.Read(nonce[:])
+	if err != nil {
+		log.Fatalf("Could not read port from gpg nonce: %q", err)
+	}
+
+	if n != 16 {
+		log.Fatal("Could not connet gpg: incorrect number of bytes for nonceRead incorrect number of bytes for nonce")
+	}
+
+	gpgConn, err := net.Dial("tcp", fmt.Sprintf("localhost:%d", port))
+	if err != nil {
+		log.Fatalf("Could not connet gpg: %s", err)
+	}
+
+	_, err = gpgConn.Write(nonce[:])
+	if err != nil {
+		log.Fatalf("Could not authenticate gpg: %q\n", err)
+	}
+
+	go func() {
+		_, err := io.Copy(gpgConn, conn)
+		if err != nil && err != io.EOF {
+			log.Printf("Could not copy gpg data from assuan socket to socket: %q\n", err)
+		}
+	}()
+
+	_, err = io.Copy(conn, gpgConn)
+	if err != nil && err != io.EOF {
+		log.Printf("Could not copy gpg data from socket to assuan socket: %q\n", err)
+	}
+}
+
+func listenLoop(ln net.Listener, handler func(conn net.Conn)) {
 	defer ln.Close()
 
 	for {
@@ -183,8 +262,42 @@ func listenLoop(ln net.Listener) {
 			log.Printf("New connection: %v\n", conn)
 		}
 
-		go handleConnection(conn)
+		go handler(conn)
 	}
+}
+
+func gpg(assuan, socket string) {
+	unix, err := net.Listen("unix", socket)
+	if *force && err != nil {
+		log.Printf("Could not open socket %s, error '%s'\nTrying to unlink %s\n", socket, err, socket)
+		operr, ok := err.(*net.OpError)
+		if !ok {
+			log.Fatalf("Could not unlink socket %s, error is not *net.OpError\n", socket)
+		}
+		syscallerr, ok := operr.Err.(*os.SyscallError)
+		if !ok {
+			log.Fatalf("Could not unlink socket %s, error is not *os.SyscallError\n", socket)
+		}
+		errno, ok := syscallerr.Err.(syscall.Errno)
+		if !ok {
+			log.Fatalf("Could not unlink socket %s, error is not syscall.Errno\n", socket)
+		}
+		if errno == errorSocketAlreadyInUse {
+			if err := syscall.Unlink(*gpgSocket); err != nil {
+				log.Fatalf("Could not unlink socket %s, error %q\n", socket, err)
+			}
+		}
+		unix, err = net.Listen("unix", socket)
+	}
+	if err != nil {
+		log.Fatalf("Could not open socket %s, error '%s'\n", socket, err)
+	}
+
+	// defer unix.Close()
+	log.Printf("Listening on Unix socket: %s\n", socket)
+	go func() {
+		listenLoop(unix, func(conn net.Conn) { handleGPGConnection(conn, assuan) })
+	}()
 }
 
 func main() {
@@ -236,7 +349,7 @@ func main() {
 		defer unix.Close()
 		log.Printf("Listening on Unix socket: %s\n", *unixSocket)
 		go func() {
-			listenLoop(unix)
+			listenLoop(unix, handleSSHConnection)
 			// If for some reason our listener breaks, kill the program
 			done <- true
 		}()
@@ -254,13 +367,60 @@ func main() {
 		defer pipe.Close()
 		log.Printf("Listening on named pipe: %s\n", namedPipeFullName)
 		go func() {
-			listenLoop(pipe)
+			listenLoop(pipe, handleSSHConnection)
 			// If for some reason our listener breaks, kill the program
 			done <- true
 		}()
 	}
 
-	if *namedPipe == "" && *unixSocket == "" {
+	if *dockerSocket != "" {
+		unix, err = net.Listen("unix", *dockerSocket)
+		if *force && err != nil {
+			log.Printf("Could not open socket %s, error '%s'\nTrying to unlink %s\n", *unixSocket, err, *dockerSocket)
+			operr, ok := err.(*net.OpError)
+			if !ok {
+				log.Fatalf("Could not unlink socket %s, error is not *net.OpError\n", *dockerSocket)
+			}
+			syscallerr, ok := operr.Err.(*os.SyscallError)
+			if !ok {
+				log.Fatalf("Could not unlink socket %s, error is not *os.SyscallError\n", *dockerSocket)
+			}
+			errno, ok := syscallerr.Err.(syscall.Errno)
+			if !ok {
+				log.Fatalf("Could not unlink socket %s, error is not syscall.Errno\n", *dockerSocket)
+			}
+			if errno == errorSocketAlreadyInUse {
+				if err := syscall.Unlink(*dockerSocket); err != nil {
+					log.Fatalf("Could not unlink socket %s, error %q\n", *dockerSocket, err)
+				}
+			}
+			unix, err = net.Listen("unix", *dockerSocket)
+		}
+		if err != nil {
+			log.Fatalf("Could not open socket %s, error '%s'\n", *dockerSocket, err)
+		}
+
+		defer unix.Close()
+		log.Printf("Listening on Unix socket: %s\n", *dockerSocket)
+		go func() {
+			listenLoop(unix, handleDockerConnection)
+			// If for some reason our listener breaks, kill the program
+			done <- true
+		}()
+	}
+
+	if *gpgSocket != "" {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			log.Fatal("failed to find user home dir")
+		}
+		basePath := filepath.Join(homeDir, "AppData", "Roaming", "gnugpg")
+		gpg(filepath.Join(basePath, "S.gpg-agent"), filepath.Join(*gpgSocket, "S.gpg-agent"))
+		gpg(filepath.Join(basePath, "S.gpg-agent.browser"), filepath.Join(*gpgSocket, "S.gpg-agent.browser"))
+		gpg(filepath.Join(basePath, "S.gpg-agent.extra"), filepath.Join(*gpgSocket, "S.gpg-agent.extra"))
+	}
+
+	if *namedPipe == "" && *unixSocket == "" && *dockerSocket == "" && *gpgSocket == "" {
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
