@@ -283,7 +283,7 @@ func gpg(assuan, socket string) {
 			log.Fatalf("Could not unlink socket %s, error is not syscall.Errno\n", socket)
 		}
 		if errno == errorSocketAlreadyInUse {
-			if err := syscall.Unlink(*gpgSocket); err != nil {
+			if err := syscall.Unlink(socket); err != nil {
 				log.Fatalf("Could not unlink socket %s, error %q\n", socket, err)
 			}
 		}
@@ -414,7 +414,7 @@ func main() {
 		if err != nil {
 			log.Fatal("failed to find user home dir")
 		}
-		basePath := filepath.Join(homeDir, "AppData", "Roaming", "gnugpg")
+		basePath := filepath.Join(homeDir, "AppData", "Roaming", "gnupg")
 		gpg(filepath.Join(basePath, "S.gpg-agent"), filepath.Join(*gpgSocket, "S.gpg-agent"))
 		gpg(filepath.Join(basePath, "S.gpg-agent.browser"), filepath.Join(*gpgSocket, "S.gpg-agent.browser"))
 		gpg(filepath.Join(basePath, "S.gpg-agent.extra"), filepath.Join(*gpgSocket, "S.gpg-agent.extra"))
